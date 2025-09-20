@@ -51,7 +51,7 @@ LatticeBench は、**物理的制約（ユニタリティ・ゲージ対称性�
 
 ---
 
-## 🚧 Limitations & Future Work | 制約と今後の展望
+# 🚧 Limitations & Future Work | 制約と今後の展望
 
 - **Scope (PoC):** This repository favors **experimentability over validity**. No claim of physical correctness.
 - **Small lattice / SU(2):** All experiments use a **4×4 periodic lattice** with the **SU(2)** gauge group.
@@ -64,6 +64,87 @@ LatticeBench は、**物理的制約（ユニタリティ・ゲージ対称性�
 - **小規模格子 / SU(2):** 実験は **4×4 周期格子**・**SU(2)** を前提としています。
 - **モデル再利用・推論専用:** 現段階では **前提としていません**。  
   ただし、**次元/複雑さの拡大**（例：SU(3) や 3D/4D）では、**学習済みモデルの保存・再利用**（推論や **ウォームスタート / 微調整**）の有効性が高まる可能性があります。
+
+> Looking ahead, if we ever succeed in building a PINN structure that reproduces target observables with **sufficiently small loss**, such solutions may offer **hints toward better theoretical formulations**—even if they are still numeric surrogates rather than validated physical models.  
+> 将来に向けて言えば、**損失が十分に小さい PINN 構造**を確立できた場合、厳密な物理モデルには至らなくても、**理論的枠組みへのヒント**を与える可能性があります。
+
+---
+
+## 🔎 Model Analysis & Interpretability | モデル解析と可解釈性
+
+**English**  
+To keep claims scientifically cautious while extracting insight from trained models, we propose the following **analysis protocol**. Each item is phrased to avoid over-claiming and focuses on verifiable properties on a 2D SU(2), 4×4 lattice.
+
+1. **Gauge-consistency checks (invariance/equivariance)**  
+   - Verify that predictions of gauge-invariant quantities (plaquette/Wilson loops) are **unchanged under random local SU(2) gauge transforms** of inputs.  
+   - Where alignment is used, report metrics both **before** and **after** gauge alignment to quantify reliance on alignment.
+
+2. **Layer-wise constraint diagnostics**  
+   - Monitor unitarity deviation per layer/output: `||U^† U - I||_F`.  
+   - Track how much each loss term (plaquette, Wilson, Creutz, unitarity, smoothness) **contributes to total loss** at convergence.
+
+3. **Sensitivity analysis (saliency/Jacobians)**  
+   - Compute `∂L/∂U_{x,μ}` and aggregate by local motifs (links, plaquettes, rectangles) to see **which structures drive the loss**.  
+   - Compare sensitivities across loss types (MSE vs Huber) to identify **robust vs brittle** contributions.
+
+4. **Probing internal representations**  
+   - Train **linear probes** from hidden features to reconstruct gauge-invariant observables (plaquette trace, Wilson loops not used by the loss).  
+   - If simple probes succeed on **hold-out loop shapes/sizes** (excluded from loss), it suggests the network has learned **useful inductive structure** beyond targets.
+
+5. **Ablation & constraint toggling**  
+   - Retrain while removing or scaling individual loss terms; measure shifts in the **empirical Pareto front** (`GA-RMSE` vs `|ΔTrP|`).  
+   - This isolates **which constraints are necessary/sufficient** for particular behaviors.
+
+6. **Cross-seed stability & similarity**  
+   - Train multiple seeds; report variance of metrics and **representation similarity** (e.g., CKA) to assess whether learned structure is **seed-robust** or accidental.
+
+7. **Generalization beyond training targets (validation-only observables)**  
+   - Evaluate **observables intentionally excluded from the loss** (e.g., larger Wilson loops).  
+   - These serve as **validation-only metrics**: if reproduced well, they indicate the model has captured structure beyond direct fitting.
+
+8. **Baseline comparisons (sanity checks)**  
+   - Compare against simple baselines (random SU(2) fields, smoothed/random-phase fields) and, where available, **small-lattice Monte Carlo** or strong-coupling estimates for the same observables.  
+   - Report effect sizes, not just p-values, to avoid overstating small differences on tiny lattices.
+
+**Caveats.** Low loss on a tiny lattice **does not imply** a correct continuum theory or scaling behavior. Results may be **non-identifiable** up to gauge and other symmetries; always report the evaluation protocol (gauge treatment, validation-only observables, seeds).
+
+---
+
+**日本語**  
+主張を慎重に保ちつつ学習済みモデルから示唆を得るため、以下の **解析プロトコル**を提案します。いずれも 2D SU(2)、4×4 格子で検証可能な範囲に留めています。
+
+1. **ゲージ整合性（不変性/等変性）チェック**  
+   - 入力に **局所 SU(2) ゲージ変換**をランダム適用しても、プラークエットや Wilson ループなどの **ゲージ不変量の予測が不変**であるか確認。  
+   - ゲージアラインメントを用いる場合は、**前後の指標**を併記して、整合の依存度を明示。
+
+2. **層別の制約診断**  
+   - 各層/出力でのユニタリティ逸脱 `||U^† U - I||_F` を監視。  
+   - 収束時点で各損失項（プラークエット、Wilson、Creutz、ユニタリティ、スムース）の **寄与率**を分解。
+
+3. **感度解析（サリエンシー/ヤコビアン）**  
+   - `∂L/∂U_{x,μ}` を計算し、リンク/プラークエット/長方形などの **局所構造ごとに集約**して、損失を支配する構造を特定。  
+   - MSE と Huber で感度の **頑健/脆弱な差**を比較。
+
+4. **内部表現へのプロービング**  
+   - 中間特徴から **線形プローブ**で、学習に直接使っていないゲージ不変量（例：未使用サイズの Wilson ループ）を再構成。  
+   - **ホールドアウト形状/サイズ**で再現性が高ければ、ターゲット超えの **構造学習**の示唆。
+
+5. **アブレーション（制約の切替）**  
+   - 個別損失項の削除/スケーリングで再学習し、**経験的パレート前線**（`GA-RMSE` と `|ΔTrP|`）の移動を観察。  
+   - どの制約が **必要/十分**かを切り分け。
+
+6. **シード間安定性と表現類似**  
+   - 複数シード学習で指標分散と **表現類似度**（例：CKA）を報告し、学習構造が偶然ではないかを評価。
+
+7. **学習ターゲット外への一般化（検証専用観測量）**  
+   - 一部の観測量（例：より大きな Wilson ループ）を **loss から除外**し、**検証専用の評価指標**として利用。  
+   - 良好に再現できれば、単なる当てはめではなく **構造的理解の獲得**を示唆。
+
+8. **ベースライン比較（健全性確認）**  
+   - 簡易ベースライン（ランダム SU(2) 場、位相平滑化場など）や、可能なら **小規模格子のモンテカルロ**/強結合近似の同一観測量と比較。  
+   - 小格子ゆえの偶然性を避けるため、p値だけでなく **効果量**も併記。
+
+**注意.** 小さな格子での低損失は、連続極限やスケーリングの正しさを **保証しません**。結果はゲージ等の対称性により **同定不能**な場合があるため、評価手順（ゲージ処理、検証専用観測量、シード）を必ず明記してください。
 
 ---
 
@@ -101,6 +182,7 @@ numpy
 torch
 pandas
 matplotlib
+optuna
 ```
 
 > Note: `requirements.txt` deliberately excludes GPU‑specific builds of PyTorch.
@@ -189,6 +271,29 @@ bash run.bash
   （スクリプト先頭の配列を編集して探索範囲を調整できます）
 - Logs and artifacts are ignored by git via `.gitignore` (`runs/`)。  
   （`runs/` は `.gitignore` 済み）
+
+---
+
+## 🔍 Hyperparameter Search with Optuna | Optunaによる探索
+
+**English**  
+In addition to the grid search (`run.bash`), we provide an **Optuna-based search script**  
+(`src/optuna_search.py`) for more flexible hyperparameter tuning.  
+This can help explore the Pareto front between `GA-RMSE` and `|ΔTrP|` more efficiently.
+
+**日本語**  
+グリッド探索（`run.bash`）に加え、**Optuna を用いた探索スクリプト**  
+（`src/optuna_search.py`）も用意しています。  
+これにより、`GA-RMSE` と `|ΔTrP|` のパレートフロントをより効率的に探索可能です。
+
+### Run
+
+```bash
+python -m src.optuna_search --trials 200 --epochs 500
+```
+
+- --trials: 試行回数
+- --epochs: 各試行の学習エポック数
 
 ---
 
