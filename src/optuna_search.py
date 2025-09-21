@@ -1,191 +1,318 @@
-# src/optuna_search.py
-# -----------------------------------------------------------------------------
-# Multi-objective hyperparameter search with Optuna (NSGA-II).
-# Objectives (minimize both):
-#   1) GA-RMSE            -> "ga_rmse"
-#   2) |Δ avgTrP|         -> "avgTrP_absdiff"
-#
-# Each trial calls your existing CLI:
-#   python -m src.train ... | tee runs/OPT_*.log
-# Then parses metrics via:
-#   python -m src.analyze_log <log> --out <csv>
-#
-# Example usage (overnight):
-#   pip install optuna
-#   python -m src.optuna_search --trials 100 --epochs 900 \
-#       --storage sqlite:///optuna.db --study latticebench-multiobj --n_jobs 1
-#
-# Tips:
-# - For a single GPU/CPU box, keep --n_jobs=1 (subprocess per trial).
-# - You can resume the same study later with the same --storage/--study.
-# - If you want a quicker warm-up search, use --epochs 300 first.
-# -----------------------------------------------------------------------------
+"""
+Optuna search for LatticeBench hyperparameters
+==============================================
+
+特徴:
+- ほぼ全ハイパラを CLI から「固定 or 探索レンジ」で指定可能
+- 対数スケール探索 (--*_log) やカテゴリ選択 (use_huber) に対応
+- 途中再開 (RDB storage) / 並列 (--n_jobs) / スタディ名指定
+- すべての試行とパレート前線を CSV/PNG/JSON に保存
+
+使い方（例）:
+  # 1) 代表的な探索（学習率・各重みなど）
+  python -m src.optuna_search \
+    --trials 120 --epochs 900 --study latticebench-wide \
+    --lr_min 3e-3 --lr_max 8e-3 --lr_log \
+    --w_plaq_min 0.0 --w_plaq_max 0.20 \
+    --w_wil12_min 0.20 --w_wil12_max 0.70 \
+    --w_cr_min 0.30 --w_cr_max 0.80 \
+    --huber_delta_wil_min 0.001 --huber_delta_wil_max 0.02 \
+    --huber_delta_cr_min  0.002 --huber_delta_cr_max  0.05 \
+    --search_use_huber True False \
+    --n_jobs 1
+
+  # 2) 一部は固定、一部は探索（w_wil11等を固定）
+  python -m src.optuna_search \
+    --trials 80 --epochs 900 --study latticebench-fixsome \
+    --lr_min 3e-3 --lr_max 6e-3 --lr_log \
+    --w_plaq_min 0.0 --w_plaq_max 0.10 \
+    --w_wil11 0.10 --w_wil22 0.28 --w_wil13 0.22 --w_wil23 0.18 \
+    --w_wil12_min 0.25 --w_wil12_max 0.60 \
+    --w_cr_min 0.40 --w_cr_max 0.75 \
+    --search_use_huber True False
+
+  # 3) 多数の正則化重みも探索に含める
+  python -m src.optuna_search \
+    --trials 150 --epochs 900 --study latticebench-regs \
+    --lr_min 3e-3 --lr_max 8e-3 --lr_log \
+    --w_unitary_min 0.03 --w_unitary_max 0.12 \
+    --w_phi_smooth_min 0.02 --w_phi_smooth_max 0.08 \
+    --w_theta_smooth_min 0.01 --w_theta_smooth_max 0.06 \
+    --w_phi_l2_min 0.0005 --w_phi_l2_max 0.01 \
+    --search_use_huber True False
+"""
 
 import argparse
-import os
-import shlex
-import subprocess
-from datetime import datetime
 from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 import optuna
-from optuna.samplers import NSGAIISampler
+import pandas as pd
+import matplotlib.pyplot as plt
 
-METRIC_GA = "ga_rmse"
-METRIC_PL = "avgTrP_absdiff"
-
-
-def _run_cmd(cmd: str) -> int:
-    print(f"[CMD] {cmd}")
-    return subprocess.call(cmd, shell=True)
+from .train import TrainConfig, run_training
 
 
-def run_train_and_parse(args, log_path: Path):
-    """Run one training config and parse metrics via analyze_log."""
-    base = [
-        "python", "-m", "src.train",
-        "--epochs", str(args.epochs),
-        "--print_every", str(max(50, args.epochs // 10)),
-        "--lr", str(args.lr),
-        "--seed", str(args.seed),
-        "--w_wil11", "0.10",
-        "--w_wil22", "0.28",
-        "--w_wil13", "0.22",
-        "--w_wil23", "0.18",
-        "--w_cr", str(args.w_cr),
-        "--w_plaq", str(args.w_plaq),
-        "--w_unitary", "0.06",
-        "--w_phi_smooth", "0.04",
-        "--w_theta_smooth", "0.02",
-        "--w_phi_l2", "0.002",
-        "--w_wil12", str(args.w_wil12),
-    ]
-
-    if args.use_huber:
-        base += [
-            "--use_huber",
-            "--huber_delta_wil", str(args.huber_delta_wil),
-            "--huber_delta_cr", str(args.huber_delta_cr),
-        ]
-
-    Path("runs").mkdir(exist_ok=True)
-    cmd = " ".join(shlex.quote(s) for s in base) + f" | tee {shlex.quote(str(log_path))}"
-    rc = _run_cmd(cmd)
-    if rc != 0:
-        raise RuntimeError(f"Training failed with exit code {rc}")
-
-    out_csv = log_path.with_suffix(".csv")
-    cmd2 = f"python -m src.analyze_log {shlex.quote(str(log_path))} --out {shlex.quote(str(out_csv))}"
-    rc2 = _run_cmd(cmd2)
-    if rc2 != 0 or not out_csv.exists():
-        raise RuntimeError("analyze_log failed to produce a CSV.")
-
-    import pandas as pd
-    df = pd.read_csv(out_csv)
-    if METRIC_GA not in df.columns or METRIC_PL not in df.columns:
-        raise RuntimeError(f"CSV missing required columns: {METRIC_GA}, {METRIC_PL}")
-    row = df.iloc[0].to_dict()
-    return float(row[METRIC_GA]), float(row[METRIC_PL]), row  # (ga_rmse, avgTrP_absdiff, all_fields)
+# -----------------------------------------------------------------------------
+# 汎用サジェストヘルパ
+# -----------------------------------------------------------------------------
+def suggest_or_fixed_float(
+    trial: optuna.trial.Trial,
+    name: str,
+    fixed: Optional[float],
+    lo: Optional[float],
+    hi: Optional[float],
+    log: bool = False,
+    default_if_missing: Optional[float] = None,
+) -> float:
+    """
+    fixed が与えられれば固定値を返す。
+    lo/hi が両方与えられれば suggest_float。
+    どちらも無ければ default_if_missing を返す（Noneの場合はエラー）。
+    """
+    if fixed is not None:
+        return float(fixed)
+    if lo is not None and hi is not None:
+        if log:
+            return trial.suggest_float(name, float(lo), float(hi), log=True)
+        return trial.suggest_float(name, float(lo), float(hi))
+    if default_if_missing is not None:
+        return float(default_if_missing)
+    raise ValueError(f"{name}: neither fixed nor (lo,hi) provided.")
 
 
-def build_trial_args(trial, base_epochs: int):
-    """Sample hyperparameters from widened ranges and package as a simple object."""
-    class Args:
-        pass
-
-    a = Args()
-    a.epochs = base_epochs
-
-    # Learning rate (log scale)
-    a.lr = trial.suggest_float("lr", 5e-4, 5e-3, log=True)
-
-    # Loss weights
-    a.w_plaq = trial.suggest_float("w_plaq", 0.005, 0.08, log=True)
-    a.w_wil12 = trial.suggest_float("w_wil12", 0.24, 0.72)
-    a.w_cr = trial.suggest_float("w_cr", 0.35, 0.80)
-
-    # Seed
-    a.seed = trial.suggest_categorical("seed", [42, 777])
-
-    # Loss type: MSE vs Huber (+ deltas)
-    a.use_huber = trial.suggest_categorical("use_huber", [False, True])
-    if a.use_huber:
-        a.huber_delta_wil = trial.suggest_float("huber_delta_wil", 0.0015, 0.006, log=True)
-        a.huber_delta_cr = trial.suggest_float("huber_delta_cr", 0.004, 0.016, log=True)
-    else:
-        a.huber_delta_wil = None
-        a.huber_delta_cr = None
-
-    return a
+def suggest_or_fixed_categorical(
+    trial: optuna.trial.Trial,
+    name: str,
+    fixed: Optional[Any],
+    choices: Optional[List[Any]],
+    default_if_missing: Optional[Any] = None,
+) -> Any:
+    """
+    fixed が与えられれば固定値、なければ choices から suggest_categorical。
+    両方無ければ default_if_missing。なければエラー。
+    """
+    if fixed is not None:
+        return fixed
+    if choices:
+        return trial.suggest_categorical(name, choices)
+    if default_if_missing is not None:
+        return default_if_missing
+    raise ValueError(f"{name}: neither fixed nor choices provided.")
 
 
-def objective_multi(trial: optuna.Trial, base_epochs: int, tag: str):
-    targs = build_trial_args(trial, base_epochs)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    log_name = f"runs/OPT_{tag}_t{trial.number}_{ts}.log"
-    ga, pl, fields = run_train_and_parse(targs, Path(log_name))
+# ---------------------------------------------------------------------
+# 検索空間の構築（CLIの fixed / min-max / log 指定を反映）
+# ---------------------------------------------------------------------
+def build_search_space(trial: optuna.trial.Trial, A: argparse.Namespace) -> TrainConfig:
+    # --- 学習率 ---
+    lr = suggest_or_fixed_float(
+        trial, "lr",
+        fixed=A.lr,
+        lo=A.lr_min, hi=A.lr_max,
+        log=bool(A.lr_log),
+        default_if_missing=1e-2,  # どれも未指定なら既定値
+    )
 
-    trial.set_user_attr("log_path", log_name)
-    trial.set_user_attr("metrics", fields)
+    # --- Huber 使用（固定 or カテゴリ探索）---
+    use_huber = suggest_or_fixed_categorical(
+        trial, "use_huber",
+        fixed=A.use_huber,
+        choices=A.search_use_huber,      # 例: [True, False]
+        default_if_missing=False,
+    )
 
-    return ga, pl  # two objectives (minimize)
+    # まとめ関数: 各パラに対して fixed / min-max を使い分け
+    def S(name: str, *, log: bool = False, default: Optional[float] = None) -> float:
+        return suggest_or_fixed_float(
+            trial, name,
+            fixed=getattr(A, name, None),
+            lo=getattr(A, f"{name}_min", None),
+            hi=getattr(A, f"{name}_max", None),
+            log=log,
+            default_if_missing=default,
+        )
+
+    return TrainConfig(
+        # --- ベース設定（固定値） ---
+        L=getattr(A, "L", 4),
+        hidden=getattr(A, "hidden", 32),
+        epochs=A.epochs,
+        seed=getattr(A, "seed", 42),
+        print_every=getattr(A, "print_every", 200),
+        logfile=None, csv=None,
+
+        # --- 探索パラ ---
+        lr=lr,
+        w_plaq=S("w_plaq", default=0.0),
+        w_wil11=S("w_wil11", default=0.10),
+        w_wil12=S("w_wil12", default=0.28),
+        w_wil22=S("w_wil22", default=0.20),
+        w_wil13=S("w_wil13", default=0.22),
+        w_wil23=S("w_wil23", default=0.18),
+        w_cr=S("w_cr", default=0.20),
+
+        w_unitary=S("w_unitary", default=0.05),
+        w_phi_smooth=S("w_phi_smooth", default=0.06),
+        w_theta_smooth=S("w_theta_smooth", default=0.03),
+        w_phi_l2=S("w_phi_l2", log=True, default=3e-3),
+
+        use_huber=use_huber,
+        huber_delta_wil=S("huber_delta_wil", log=True, default=1e-2),
+        huber_delta_cr=S("huber_delta_cr",  log=True, default=4e-2),
+
+        # 教師場の強さも（必要なら）探索
+        teacher_scale=S("teacher_scale", default=0.6) if hasattr(A, "teacher_scale") or hasattr(A, "teacher_scale_min") else 0.6,
+    )
 
 
+# -----------------------------------------------------------------------------
+# 可視化と成果物の保存
+# -----------------------------------------------------------------------------
+def save_artifacts(study: optuna.Study, outdir: Path, top_k: int = 5) -> None:
+    outdir.mkdir(exist_ok=True)
+
+    # --- すべての trial を表形式で保存 ---
+    rows_all: List[Dict[str, Any]] = []
+    for t in study.trials:
+        if t.values is None:
+            continue
+        cfg = t.user_attrs.get("cfg", {})
+        rows_all.append({
+            "number": t.number,
+            "ga_rmse": t.values[0],
+            "avgTrP_absdiff": t.values[1],
+            "state": str(t.state),
+            **{f"cfg_{k}": v for k, v in cfg.items()},
+            **{f"param_{k}": v for k, v in t.params.items()},
+        })
+    df_all = pd.DataFrame(rows_all)
+    df_all.to_csv(outdir / "all_trials.csv", index=False)
+
+    # --- パレート前線だけ保存 ---
+    pareto = study.best_trials
+    rows_p: List[Dict[str, Any]] = []
+    for t in pareto:
+        cfg = t.user_attrs.get("cfg", {})
+        rows_p.append({
+            "number": t.number,
+            "ga_rmse": t.values[0],
+            "avgTrP_absdiff": t.values[1],
+            **{f"cfg_{k}": v for k, v in cfg.items()},
+        })
+    df_p = pd.DataFrame(rows_p).sort_values(["ga_rmse", "avgTrP_absdiff"], ascending=[True, True])
+    df_p.to_csv(outdir / "pareto_trials.csv", index=False)
+
+    # --- Top-k by objectives ---
+    if not df_all.empty:
+        df_all.sort_values("ga_rmse", ascending=True).head(top_k).to_json(outdir / "topk_by_ga_rmse.json", orient="records", indent=2)
+        df_all.sort_values("avgTrP_absdiff", ascending=True).head(top_k).to_json(outdir / "topk_by_dAvgTrP.json", orient="records", indent=2)
+
+    # --- 散布図（パレートを強調） ---
+    if not df_all.empty:
+        plt.figure(figsize=(7.5, 6))
+        plt.scatter(df_all["ga_rmse"], df_all["avgTrP_absdiff"], s=16, alpha=0.3, label="All trials")
+        if not df_p.empty:
+            plt.plot(df_p["ga_rmse"], df_p["avgTrP_absdiff"], "o-", label="Pareto front", ms=5)
+        plt.xlabel("Gauge-aligned RMSE (lower is better)")
+        plt.ylabel("|Δ avgTrP| (lower is better)")
+        plt.title("Optuna search: ga_rmse vs |Δ avgTrP|")
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(outdir / "pareto_scatter.png", dpi=150)
+        plt.close()
+
+
+# -----------------------------------------------------------------------------
+# CLI
+# -----------------------------------------------------------------------------
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--trials", type=int, default=100, help="Number of trials")
-    ap.add_argument("--epochs", type=int, default=900, help="Epochs per trial")
-    ap.add_argument("--timeout", type=int, default=None, help="Seconds to stop after (optional)")
-    ap.add_argument("--storage", type=str, default=None, help='Optuna storage, e.g., \"sqlite:///optuna.db\"')
-    ap.add_argument("--study", type=str, default="latticebench-multiobj", help="Study name")
-    ap.add_argument("--n_jobs", type=int, default=1, help="Parallel workers (>=2 requires RDB storage)")
-    args = ap.parse_args()
+    ap = argparse.ArgumentParser(description="Optuna search over LatticeBench hyperparameters")
 
-    sampler = NSGAIISampler(seed=2025)
+    # ベース構成（固定）
+    ap.add_argument("--L", type=int, default=4)
+    ap.add_argument("--hidden", type=int, default=32)
+    ap.add_argument("--epochs", type=int, default=900)
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--print_every", type=int, default=200)
+
+    # Optuna 実行設定
+    ap.add_argument("--trials", type=int, default=120)
+    ap.add_argument("--storage", type=str, default=None, help="e.g., sqlite:///optuna.db")
+    ap.add_argument("--study", type=str, default="latticebench")
+    ap.add_argument("--n_jobs", type=int, default=1)
+    ap.add_argument("--artifacts_dir", type=str, default="optuna_artifacts")
+    ap.add_argument("--topk", type=int, default=5)
+
+    # ======== 探索 or 固定: 学習率 ========
+    ap.add_argument("--lr", type=float, default=None, help="固定学習率。指定があればレンジ無視")
+    ap.add_argument("--lr_min", type=float, default=None)
+    ap.add_argument("--lr_max", type=float, default=None)
+    ap.add_argument("--lr_log", action="store_true", help="学習率を対数スケールで探索")
+
+    # ======== 探索 or 固定: Huber 使用 ========
+    ap.add_argument("--use_huber", type=lambda s: s.lower() in {"1","true","t","yes","y"}, default=None,
+                    help="固定: True/False。指定が無ければ --search_use_huber でカテゴリ探索")
+    ap.add_argument("--search_use_huber", nargs="*", default=None,
+                    help="例: --search_use_huber True False")
+
+    # ======== 探索 or 固定: 個別重み（固定値 or レンジ） ========
+    def add_float_param(name, default=None):
+        ap.add_argument(f"--{name}", type=float, default=default)
+        ap.add_argument(f"--{name}_min", type=float, default=None)
+        ap.add_argument(f"--{name}_max", type=float, default=None)
+
+    for p in [
+        "w_plaq",
+        "w_wil11", "w_wil12", "w_wil22", "w_wil13", "w_wil23",
+        "w_cr",
+        "w_unitary", "w_phi_smooth", "w_theta_smooth", "w_phi_l2",
+        "huber_delta_wil", "huber_delta_cr",
+    ]:
+        add_float_param(p)
+
+    A = ap.parse_args()
+
+    # 文字列 True/False を bool に変換（--search_use_huber）
+    if A.search_use_huber is not None:
+        parsed_choices: List[bool] = []
+        for s in A.search_use_huber:
+            if isinstance(s, bool):
+                parsed_choices.append(s)
+            else:
+                parsed_choices.append(str(s).lower() in {"1","true","t","yes","y"})
+        A.search_use_huber = parsed_choices
+
+    # スタディ作成
     study = optuna.create_study(
+        study_name=A.study,
+        storage=A.storage,
         directions=["minimize", "minimize"],
-        sampler=sampler,
-        study_name=args.study,
-        storage=args.storage,
         load_if_exists=True,
     )
 
-    print(f"[INFO] Starting study '{args.study}' (trials={args.trials}, epochs={args.epochs}, n_jobs={args.n_jobs})")
-    study.optimize(lambda tr: objective_multi(tr, args.epochs, tag=args.study),
-                   n_trials=args.trials, timeout=args.timeout, n_jobs=args.n_jobs, gc_after_trial=True)
+    # 目的関数
+    def objective(trial):
+        cfg = build_search_space(trial, A)  # ← trial を渡す
+        print(f"[trial {trial.number}] params={trial.params}")
+        
+        results = run_training(cfg, quiet=True)
+        # 便利な情報を残す
+        trial.set_user_attr("cfg", cfg.__dict__)
+        trial.set_user_attr("ga_rmse", results["ga_rmse"])
+        trial.set_user_attr("avgTrP_absdiff", results["avgTrP_absdiff"])
+        # 2目的最小化
+        # （create_studyで directions=["minimize","minimize"] を指定済みであること）
+        return results["ga_rmse"], results["avgTrP_absdiff"]
 
-    # Save Pareto trials
-    os.makedirs("optuna_artifacts", exist_ok=True)
-    pareto = [t for t in study.best_trials]  # non-dominated set
-    import pandas as pd
-    rows = []
-    for t in pareto:
-        row = {"trial": t.number, METRIC_GA: t.values[0], METRIC_PL: t.values[1]}
-        row.update(t.params)
-        row["log_path"] = t.user_attrs.get("log_path", "")
-        rows.append(row)
-    df = pd.DataFrame(rows).sort_values([METRIC_GA, METRIC_PL])
-    csv_path = "optuna_artifacts/pareto_trials.csv"
-    df.to_csv(csv_path, index=False)
-    print(f"[INFO] Pareto trials saved -> {csv_path}")
+    # 最適化
+    study.optimize(objective, n_trials=A.trials, n_jobs=A.n_jobs)
 
-    # Plot
-    import matplotlib.pyplot as plt
-    plt.figure()
-    plt.scatter(df[METRIC_PL], df[METRIC_GA], s=20, alpha=0.8)
-    plt.xlabel("|Δ avgTrP|")
-    plt.ylabel("GA-RMSE")
-    plt.title("Optuna Pareto Trials")
-    plt.grid(True, linestyle="--", alpha=0.3)
-    plot_path = "optuna_artifacts/pareto_trials.png"
-    Path("optuna_artifacts").mkdir(exist_ok=True)
-    plt.savefig(plot_path, bbox_inches="tight")
-    print(f"[INFO] Plot saved -> {plot_path}")
-
-    # Top-5 JSON (quick glance)
-    top_json = "optuna_artifacts/top5.json"
-    df.head(5).to_json(top_json, orient="records", indent=2, force_ascii=False)
-    print(f"[INFO] Top-5 JSON -> {top_json}")
+    # 成果物出力
+    outdir = Path(A.artifacts_dir)
+    save_artifacts(study, outdir, top_k=A.topk)
+    print(f"[INFO] Artifacts saved to: {outdir}")
 
 
 if __name__ == "__main__":

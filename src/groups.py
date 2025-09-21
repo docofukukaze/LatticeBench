@@ -1,54 +1,145 @@
 # src/groups.py
-# EN: SU(2) utilities (Pauli matrices, exponential map, unitary penalty).
-# JA: SU(2) のユーティリティ（パウリ行列、指数写像、ユニタリ罰則）。
+# =============================================================================
+# EN: SU(2) utilities (device helpers, Pauli matrices, exponential map, penalty)
+# JA: SU(2) ユーティリティ（デバイス補助、パウリ行列、指数写像、ユニタリ罰則）
+# =============================================================================
 
+from __future__ import annotations
+from functools import lru_cache
+from typing import Optional
+
+import math
 import torch
+import torch.nn.functional as F
 
-# Device helper / デバイス補助
-def get_device():
-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-def pauli(device=None) -> torch.Tensor:
-    """EN: Return Pauli matrices σ1,σ2,σ3 as (3,2,2) complex tensor.
-       JA: パウリ行列 σ1,σ2,σ3 を (3,2,2) 複素テンソルで返す。
+# -----------------------------------------------------------------------------
+# Device helpers / デバイス補助
+# -----------------------------------------------------------------------------
+def get_device() -> torch.device:
     """
-    if device is None: device = get_device()
-    i = torch.complex(torch.tensor(0.0, device=device), torch.tensor(1.0, device=device))
-    s1 = torch.tensor([[0, 1], [1, 0]], dtype=torch.complex64, device=device)
-    s2 = torch.tensor([[0, -i], [i, 0]], dtype=torch.complex64, device=device)
-    s3 = torch.tensor([[1, 0], [0, -1]], dtype=torch.complex64, device=device)
+    EN: Prefer CUDA if available, then Apple MPS, else CPU.
+    JA: CUDA → MPS → CPU の優先でデバイスを返す。
+    """
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    # Apple MPS (Metal, Apple Silicon)
+    if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+# -----------------------------------------------------------------------------
+# Pauli matrices / パウリ行列
+# -----------------------------------------------------------------------------
+def _pauli_matrices(dtype: torch.dtype = torch.complex64) -> torch.Tensor:
+    """
+    EN: Return (σ1, σ2, σ3) on CPU as a tensor of shape (3, 2, 2).
+    JA: (σ1, σ2, σ3) を CPU 上の (3,2,2) テンソルで返す。
+    NOTE:
+      - We keep them on CPU and move to the correct device lazily with `.to(device)`.
+      - Using complex dtype here avoids later dtype promotions/mismatches.
+        （最初から complex にしておくと後の dtype 衝突を避けられます）
+    """
+    i = 1j
+    s1 = torch.tensor([[0, 1], [1, 0]], dtype=dtype)
+    s2 = torch.tensor([[0, -i], [i, 0]], dtype=dtype)
+    s3 = torch.tensor([[1, 0], [0, -1]], dtype=dtype)
     return torch.stack([s1, s2, s3], dim=0)
 
-def su2_exp(a: torch.Tensor, sigma: torch.Tensor | None = None) -> torch.Tensor:
-    """EN: Exponential map from su(2) algebra vector a (R^3) to SU(2) matrix.
-       JA: su(2) 代数ベクトル a (R^3) を SU(2) 行列に指数写像で変換。
-       Args:
-         a: (..., 3) float32
-         sigma: (3,2,2) complex Pauli matrices; if None, built on the fly.
-    """
-    device = a.device
-    if sigma is None:
-        sigma = pauli(device)
-    I2 = torch.eye(2, dtype=torch.complex64, device=device)
-    a = a.to(torch.float32)
-    norm = torch.clamp(a.norm(dim=-1, keepdim=True), min=1e-8)
-    ahat = a / norm
-    theta = norm[..., 0]
-    c = torch.cos(theta); s = torch.sin(theta)
-    comp = (ahat[..., 0][..., None, None] * sigma[0]
-          + ahat[..., 1][..., None, None] * sigma[1]
-          + ahat[..., 2][..., None, None] * sigma[2])
-    i = torch.complex(torch.tensor(0.0, device=device), torch.tensor(1.0, device=device))
-    return c[..., None, None] * I2 + i * s[..., None, None] * comp
 
-def su2_unitarity_penalty(U: torch.Tensor) -> torch.Tensor:
-    """EN: Penalty for deviation from unitarity and det=1.
-       JA: ユニタリティおよび det=1 からのずれに対する罰則。
+@lru_cache(maxsize=4)
+def pauli(dtype: torch.dtype = torch.complex64) -> torch.Tensor:
     """
-    device = U.device
-    I2 = torch.eye(2, dtype=torch.complex64, device=device)
-    Uh = U.conj().transpose(-1, -2)
-    eye_dev = ((Uh @ U) - I2).abs().pow(2).mean()
-    det = torch.linalg.det(U)
-    det_dev = (det.real - 1.0).pow(2).mean() + (det.imag).pow(2).mean()
-    return eye_dev + det_dev
+    EN: Cached Pauli matrices on CPU (by dtype). Call `.to(device)` at the use site.
+    JA: CPU 上に dtype ごとにキャッシュしたパウリ行列。使用時に `.to(device)` で移動。
+    """
+    return _pauli_matrices(dtype=dtype)
+
+
+# -----------------------------------------------------------------------------
+# SU(2) exponential map / SU(2) 指数写像
+# -----------------------------------------------------------------------------
+def su2_exp(
+    a: torch.Tensor,
+    sigma: Optional[torch.Tensor] = None,
+    out_dtype: torch.dtype = torch.complex64,
+) -> torch.Tensor:
+    r"""
+    EN:
+      Exponential map from su(2) algebra vector to SU(2) group element.
+      For a ∈ ℝ³, define θ = ||a|| and A = a·σ (2×2 complex).
+      Then
+          exp(i a·σ) = cos(θ) I + i * sinc(θ) * (a·σ),
+      where sinc(θ) = sin(θ)/θ (not PyTorch's π-sinc).
+      This form is numerically stable near θ → 0 (no explicit normalization a/||a||).
+
+    JA:
+      su(2) 代数ベクトル a から SU(2) 群要素への指数写像。
+      a ∈ ℝ³, θ = ||a||, A = a·σ（2×2複素）として
+          exp(i a·σ) = cos(θ) I + i * sinc(θ) * (a·σ),
+      ここで sinc(θ) = sin(θ)/θ（PyTorch の π-sinc とは定義が異なる点に注意）。
+      θ→0 でも a/||a|| の正規化を避けられ、数値的に安定です。
+
+    Args:
+      a: (..., 3) real tensor (float32 推奨) / 実数テンソル
+      sigma: optional Pauli matrices (3,2,2) complex on the same device as `a`.
+             None の場合は CPU キャッシュから取得し `a.device` に移動します。
+      out_dtype: output dtype (complex64 推奨)
+
+    Returns:
+      U: (..., 2, 2) complex SU(2) matrices (unitary up to FP error).
+    """
+    # shape checks
+    assert a.shape[-1] == 3, "Expected 'a' to have last dimension = 3 (su(2) algebra coords)"
+
+    device = a.device
+    a = a.to(torch.float32)  # keep algebra parameters in real32
+
+    # Prepare Pauli matrices on the same device (complex)
+    if sigma is None:
+        sigma = pauli().to(device)
+
+    # θ = ||a||  (shape: (...,))
+    a_real = a.to(torch.float32)
+    theta = torch.linalg.norm(a, dim=-1)
+
+    # A = a_x σ1 + a_y σ2 + a_z σ3  (shape: (..., 2, 2))
+    # einsum result is real * complex => complex（ただし明示キャストで安全側に）
+    a_c = a_real.to(out_dtype)                         # (...,3) -> complex
+    A = torch.einsum("...k,kij->...ij", a_c, sigma)    # (...,2,2) complex
+
+    # sinc(θ) = sin(θ)/θ を計算。torch.sinc は sin(πx)/(πx) なので注意。
+    # ⇒ sinc(θ) = torch.sinc(θ / π)
+    # Shape を (...,1,1) にしてブロードキャストを明示。
+    cos_th = torch.cos(theta).to(out_dtype)[..., None, None]
+    sinc_th = torch.sinc(theta / math.pi).to(out_dtype)[..., None, None]
+
+    # 単位行列 I_2
+    I2 = torch.eye(2, dtype=out_dtype, device=device)
+
+    # exp(i A) = cos θ I + i * sinc θ * A
+    # NOTE: ここで out_dtype を complex に固定しているため、dtype 衝突は起きません。
+    U = cos_th * I2 + (1j) * sinc_th * A
+    return U
+
+
+# -----------------------------------------------------------------------------
+# (Optional) Unitarity penalty / ユニタリティ罰則
+# -----------------------------------------------------------------------------
+def su2_unitarity_penalty(U: torch.Tensor) -> torch.Tensor:
+    """
+    EN:
+      Soft penalty for deviations from unitarity:
+          minimize || U†U - I ||_F^2
+      (det(U)=1 is analytically true for exact SU(2), but small FP drift can occur;
+       this focuses on U†U≈I which is sufficient in practice.)
+
+    JA:
+      ユニタリティ（U†U ≈ I）からの逸脱に対する軽い罰則。
+      厳密SU(2)では det(U)=1 だが、FP 誤差で少しズレる可能性があるため、
+      実務上は U†U≈I のみを重視すれば十分なことが多い。
+    """
+    I2 = torch.eye(2, dtype=U.dtype, device=U.device)
+    UhU = U.conj().transpose(-1, -2) @ U
+    return F.mse_loss(UhU, I2)
