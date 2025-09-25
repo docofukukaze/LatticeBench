@@ -1,0 +1,19 @@
+{
+  "knee": {
+    "ga_rmse": 0.3256001472473144,
+    "abs_dTrP": 0.196909099817276
+  },
+  "base_stats": {
+    "median_ga_rmse": 0.41177666187286377,
+    "median_abs_dTrP": 0.3533113300800323,
+    "q25_ga_rmse": 0.37635969370603556,
+    "q25_abs_dTrP": 0.204718142747879,
+    "median_prod_n_base": 0.07094533033965729
+  },
+  "rules": {
+    "knee_30pct_both": false,
+    "both_Q25": true,
+    "prod_gain_50pct": true
+  },
+  "decision": "ACCEPT"
+}

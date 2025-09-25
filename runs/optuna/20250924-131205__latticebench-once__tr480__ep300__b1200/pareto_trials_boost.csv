@@ -1,0 +1,1 @@
+phase,number,ga_rmse,abs_dTrP,parent_trial_id,cfg_L,cfg_hidden,cfg_epochs,cfg_seed,cfg_print_every,cfg_logfile,cfg_csv,cfg_lr,cfg_w_plaq,cfg_w_wil11,cfg_w_wil12,cfg_w_wil22,cfg_w_wil13,cfg_w_wil23,cfg_w_cr,cfg_w_unitary,cfg_w_phi_smooth,cfg_w_theta_smooth,cfg_w_phi_l2,cfg_use_huber,cfg_huber_delta_wil,cfg_huber_delta_cr,cfg_teacher_seed

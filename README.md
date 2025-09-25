@@ -292,10 +292,41 @@ Key options (subset) / 主要オプション（抜粋）:
 - `--w_plaq`, `--w_wil{11,12,22,13,23}`, `--w_cr`, regularizers, and Huber deltas can be fixed or ranged via `*_min/*_max`.
 - `--search_use_huber True False` to explore {True, False}.
 
-Artifacts / 生成物:
-- `optuna_artifacts/all_trials.csv`, `pareto_trials.csv`
-- `optuna_artifacts/pareto_scatter.png`
-- `topk_by_ga_rmse.json`, `topk_by_dAvgTrP.json`
+Artifacts (single run) / 生成物（単発実行時）:
+- `all_trials.csv`, `pareto_trials.csv`
+- `pareto_scatter.png`
+- `topk_by_ga_rmse.json`, `topk_by_abs_dTrP.json`
+
+### two-phase search | 2 段階探索
+
+**English**  
+`run_optuna.bash` provides a ready-to-run wrapper around `src/optuna_search.py`.  
+It performs a **two-phase search (Wide → Boost)** over hyperparameters on a 4×4 SU(2) lattice.  
+Artifacts (CSV/JSON/plots/decision) are written under `runs/optuna/<timestamp>__latticebench-once__.../`.
+
+**日本語**  
+`run_optuna.bash` は `src/optuna_search.py` を呼び出す実行用ラッパースクリプトです。  
+SU(2) 4×4 格子に対して **2 段階探索（Wide → Boost）** を行い、成果物（CSV/JSON/図・判定結果）を  
+`runs/optuna/<timestamp>__latticebench-once__.../` に出力します。
+
+**Run**
+
+```bash
+bash run_optuna.bash
+# logs -> runs/optuna/run_*.log
+# artifacts -> runs/optuna/2025xxxx-xxxxxx__latticebench-once__tr480__ep300__b1200/
+```
+
+**Notes | 注意**  
+- Default setting: 480 trials (Wide, 300 epochs each) → top 15% boosted to 1200 epochs.
+  （既定では Wide 480 試行・300エポック → 上位15%を Boost で1200エポックに延長）
+- Results include:
+  - `all_trials_base.csv`, `all_trials_boost.csv`
+  - `pareto_scatter_base.png`, `pareto_scatter_boost.png`
+  - `topk_by_ga_rmse_*.json`, `topk_by_abs_dTrP_*.json`
+  - `decision.json` + `_ACCEPT`/`_REJECT` marker
+- Like `run.bash`, the `runs/` directory is .gitignore-ed.
+   （`run.bash` 同様、`runs/` は `.gitignore` 済み）
 
 ---
 
@@ -327,6 +358,61 @@ python -m src.plot_runs runs.csv --outdir plots_runs --top 30
 Artifacts / 生成物:
 - `runs_all.csv` — one row per log/run  
 - `plots/` — scatter/pareto & histograms; top-k CSV by `ga_rmse` and by `|Δ avgTrP|`
+
+---
+
+## 📊 Results of Hyperparameter Search | ハイパラ探索の結果
+
+**English**  
+
+The following results are as of September 25, 2025.
+
+We executed `run_optuna.bash` on a 4×4 SU(2) lattice, using a two-phase Optuna search (Base → Boost).  
+As shown in the Pareto scatter plots below (Base vs. Boost), the **Gauge-aligned RMSE** improved in the Boost phase.  
+However, the **trade-off with the mean plaquette error** remained evident, and the Pareto front did not advance significantly.  
+
+![Base](runs/optuna/20250924-131205__latticebench-once__tr480__ep300__b1200/pareto_scatter_base.png)  
+
+![Boost](runs/optuna/20250924-131205__latticebench-once__tr480__ep300__b1200/pareto_scatter_boost.png)  
+
+From these results, it appears that with the **current loss design and model structure**,  
+further substantial improvement of the Pareto front is unlikely.  
+Future progress may require **redesigning the loss function** (e.g., dynamic weighting, new regularizers) or **revamping the model architecture** (e.g., explicitly gauge-equivariant networks).
+
+All artifacts are stored under:  
+`runs/optuna/20250924-131205__latticebench-once__tr480__ep300__b1200/`
+
+At present, while the **mean plaquette error remains difficult to reduce**,  
+the **gauge-aligned RMSE is already sufficiently low**.  
+However, these solutions are likely **numerical optima specialized to the small 4×4 lattice**,  
+and there is **no guarantee that they extrapolate to larger lattices or the continuum limit**.  
+Further verification will require the kinds of analyses described in  
+**"Model Analysis & Interpretability"**.
+
+---
+
+**日本語**  
+
+以下は 2025/9/25 時点での検討結果です。
+
+`run_optuna.bash` を実行し、SU(2) 4×4 格子で Optuna による 2 段階探索（Base → Boost）を行いました。  
+下図のパレート散布図（Base と Boost）に示すように、**Gauge-aligned RMSE の改善**は Boost 段階で確認できましたが、  
+一方で **平均プラークエット誤差とのトレードオフ**は依然として残り、パレートフロントの大きな前進は見られませんでした。  
+
+![Base](runs/optuna/20250924-131205__latticebench-once__tr480__ep300__b1200/pareto_scatter_base.png)  
+
+![Boost](runs/optuna/20250924-131205__latticebench-once__tr480__ep300__b1200/pareto_scatter_boost.png)  
+
+この結果から、**現状の loss 設計やモデル構造ではパレートフロントの大幅な改善は見込めない**ことが分かりました。  
+今後の改善には、**loss の再設計**（動的重み付け、新しい正則化項など）や、**モデル構造の刷新**（ゲージ対称性を組み込んだネットワークなど）が必要になると考えられます。  
+
+成果物は以下に格納されています：  
+`runs/optuna/20250924-131205__latticebench-once__tr480__ep300__b1200/`
+
+現時点のモデルは、**平均プラークエット誤差が下がりきらない**一方、 **Gauge-aligned RMSE は十分に低くなっています**。
+ただしこの点についても、得られた解は **「小さな 4×4 格子」に特化した数値的最適解**である可能性が高く、  
+そのまま **より大きな格子や連続極限に外挿できる保証はありません**。  
+詳細な確認のためには「モデル解析と可解釈性」で示したような分析が必要になります。
 
 ---
 
